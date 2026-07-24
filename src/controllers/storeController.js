@@ -794,7 +794,7 @@ const bulkCreateStores = async (req, res) => {
   const validDocs = [];
   for (const storeData of stores) {
     const {
-      store_name, address, city, state, zip_code,
+      store_name, address, city, state, zip_code, country,
       store_email, facebook_link, daily_rates,
     } = storeData;
 
@@ -826,6 +826,7 @@ const bulkCreateStores = async (req, res) => {
       city:           city          || null,
       state:          state         || null,
       zip_code:       zip_code      || null,
+      country:        country       || null,
       store_email:    store_email   || null,
       facebook_link:  facebook_link || null,
       user_latitude:  null,
@@ -921,6 +922,81 @@ const searchStores = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// RE-GEOCODE STORES MISSING COORDINATES (admin only)
+// ─────────────────────────────────────────────────────────────────────────────
+// Fixes stores that were already created (via bulk-create, single create, or
+// an earlier buggy upload) but never got a usable user_latitude/user_longitude
+// — including the ones that were silently missing `country` before this fix,
+// which hurt Google geocoding accuracy for non-U.S. addresses. Finds every
+// store with null/missing coords, re-runs Census → Google geocoding using
+// whatever address/city/state/zip_code/country data it already has, and
+// updates in place. No re-upload needed.
+const regeocodeStores = async (req, res) => {
+  if (req.user.role !== 1) {
+    return res.status(403).json({ message: "Admin access required" });
+  }
+
+  try {
+    const stores = await Store.find({
+      $or: [
+        { user_latitude: null },
+        { user_longitude: null },
+        { user_latitude: { $exists: false } },
+        { user_longitude: { $exists: false } },
+      ],
+    });
+
+    if (stores.length === 0) {
+      return res.json({ message: "No stores are missing coordinates", updated: [], stillMissing: [] });
+    }
+
+    const docs = stores.map((s) => ({
+      _id: s._id,
+      address: s.address,
+      city: s.city,
+      state: s.state,
+      zip_code: s.zip_code,
+      country: s.country,
+      user_latitude: s.user_latitude,
+      user_longitude: s.user_longitude,
+    }));
+
+    await geocodeDocsInPlace(docs);
+
+    const updated = [];
+    const stillMissing = [];
+
+    for (const doc of docs) {
+      if (doc.user_latitude && doc.user_longitude) {
+        await Store.updateOne(
+          { _id: doc._id },
+          { $set: { user_latitude: doc.user_latitude, user_longitude: doc.user_longitude } },
+        );
+        updated.push({ store_id: doc._id, latitude: doc.user_latitude, longitude: doc.user_longitude });
+      } else {
+        stillMissing.push({
+          store_id: doc._id,
+          address: doc.address,
+          city: doc.city,
+          state: doc.state,
+          zip_code: doc.zip_code,
+          country: doc.country,
+        });
+      }
+    }
+
+    res.json({
+      message: `${updated.length} store(s) geocoded, ${stillMissing.length} still unresolved`,
+      updated,
+      stillMissing,
+    });
+  } catch (error) {
+    console.error("Regeocode stores error:", error);
+    res.status(500).json({ message: "Server error", error: error.message });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // DELETE STORE (single, admin only)
 // ─────────────────────────────────────────────────────────────────────────────
 const deleteStore = async (req, res) => {
@@ -981,6 +1057,7 @@ module.exports = {
   checkInStore,
   getCheckedInStores,
   bulkCreateStores,
+  regeocodeStores,
   searchStores,
   deleteStore,
   deleteAllStores,

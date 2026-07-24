@@ -18,6 +18,7 @@ const {
   checkInStore,
   getCheckedInStores,
   bulkCreateStores,
+  regeocodeStores,
   searchStores,
   deleteStore,       
   deleteAllStores,   
@@ -42,6 +43,7 @@ router.get("/topPerformers", authenticate, getTopStores);
 router.post("/checkin", authenticate, checkInStore);
 router.get("/checkins", authenticate, getCheckedInStores);
 router.post("/bulk-create", authenticate, bulkCreateStores);
+router.post("/regeocode", authenticate, regeocodeStores);
 router.delete("/all", authenticate, deleteAllStores);   
 router.delete("/:id", authenticate, deleteStore);       
 
