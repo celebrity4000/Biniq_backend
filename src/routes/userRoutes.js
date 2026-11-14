@@ -35,6 +35,8 @@ const {
   getUserScansAdmin,
   getAllUsersScansAdmin,
 } = require("../controllers/scanController");
+// ── Milestone 2 addition ──────────────────────────────────────────
+const { updatePushToken } = require("../controllers/pushTokenController");
 
 const router = express.Router();
 
@@ -66,6 +68,7 @@ router.post("/create-store-owner", authenticate, createStoreOwner);
 router.delete("/reset-database", authenticate, resetDatabase);
 router.get("/user-analytics", authenticate, getUserAnalytics);
 router.get("/locationDetails", authenticate, getUserAddressesAndStatus);
+router.put("/push-token", authenticate, ...updatePushToken); // ← Milestone 2
 
 // admin
 router.get("/all-scans", authenticate, getAllUsersScansAdmin);

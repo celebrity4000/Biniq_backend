@@ -2,7 +2,14 @@ const { check, validationResult } = require("express-validator");
 const Promotion = require("../models/Promotion");
 const ProductCategory = require("../models/ProductCategory");
 const User = require("../models/User");
+const Store = require("../models/Store");
 const moment = require("moment");
+const { notifyStoreAudience } = require("../utils/notify");
+const { bumpStat } = require("../utils/dailyStats");
+
+// Templates any store may use. Featured Items / Sale / Hiring and custom
+// campaigns still require a verified store with an active subscription.
+const FREE_TEMPLATES = ["bin_price", "restock", "grand_opening", "appreciation"];
 
 const createPromotion = [
   check("category_id").notEmpty().withMessage("Category ID is required"),
@@ -38,8 +45,10 @@ const createPromotion = [
       end_date,
       visibility,
       banner_image,
+      template,
     } = req.body;
     const userId = req.user.userId;
+    const isFreeTemplate = FREE_TEMPLATES.includes(template);
 
     try {
       const user = await User.findById(userId);
@@ -55,7 +64,8 @@ const createPromotion = [
         });
       }
 
-      // ── Must be verified + approved ────────────────────────────────────
+      // ── Verification / subscription / limit: skipped for free templates ─
+      if (!isFreeTemplate) {
       const isVerified = user.verified === true || user.status === "approved";
       if (!isVerified) {
         return res.status(403).json({
@@ -82,6 +92,7 @@ const createPromotion = [
           message: `Promotion limit reached. You have used ${user.used_promotions} of ${user.total_promotions} promotions.`,
         });
       }
+      }
 
       // ── Validate category ──────────────────────────────────────────────
       const category = await ProductCategory.findById(category_id);
@@ -91,11 +102,11 @@ const createPromotion = [
 
       // ── Duplicate UPC check ────────────────────────────────────────────
       if (upc_id) {
-  const existingPromotion = await Promotion.findOne({ upc_id });
-  if (existingPromotion) {
-    return res.status(400).json({ success: false, message: "UPC ID already exists" });
-  }
-}
+        const existingPromotion = await Promotion.findOne({ upc_id });
+        if (existingPromotion) {
+          return res.status(400).json({ success: false, message: "UPC ID already exists" });
+        }
+      }
 
       // ── Create promotion ───────────────────────────────────────────────
       const promotion = new Promotion({
@@ -111,14 +122,30 @@ const createPromotion = [
         end_date: new Date(end_date),
         visibility,
         banner_image: banner_image || null,
+        template: template || null,
       });
 
       await promotion.save();
 
       // ── Update user promotion count (always track, even for unlimited) ─
-      user.used_promotions += 1;
+      if (!isFreeTemplate) user.used_promotions += 1;
       user.promotions.push(promotion._id);
       await user.save();
+
+      // ── Milestone 2: notify the store's favorited/followed audience ────
+      // Only fires for store owners (role 3) with an active store, and only
+      // for promotions that are actually Active + On — no point notifying
+      // people about a promotion they can't see yet.
+      if (user.role === 3 && status === "Active" && visibility === "On") {
+        const store = await Store.findOne({ user_id: userId });
+        if (store) {
+          notifyStoreAudience(store._id, {
+            heading: "New Promotion",
+            content: `${store.store_name} posted a new promotion: ${title}.`,
+            event_type: "new_promotion",
+          }).catch((err) => console.error("New promotion notification failed:", err.message));
+        }
+      }
 
       return res.status(201).json({
         success: true,
@@ -142,11 +169,8 @@ const getPromotions = async (req, res) => {
   try {
     const query = {};
 
-    // Only filter by user_id if explicitly passed
     if (user_id) query.user_id = user_id;
 
-    // Public feed — only show Active + On promotions
-    // Store owner viewing their own — show all statuses
     if (!user_id) {
       query.status = 'Active';
       query.visibility = 'On';
@@ -260,7 +284,31 @@ const deletePromotion = async (req, res) => {
   }
 };
 
+// POST /api/promotions/:promotion_id/view   (call when a shopper sees a promotion)
+// POST /api/promotions/:promotion_id/click  (call when a shopper taps it)
+const trackPromotion = (field) => async (req, res) => {
+  try {
+    const promotion = await Promotion.findOneAndUpdate(
+      { _id: req.params.promotion_id },
+      { $inc: { [field]: 1 } },
+      { new: true },
+    );
+    if (!promotion) return res.status(404).json({ success: false, message: "Promotion not found" });
+    if (field === "views") {
+      const store = await Store.findOne({ user_id: promotion.user_id }).select("_id");
+      if (store) bumpStat(store._id, "promo_views");
+    }
+    res.json({ success: true, [field]: promotion[field] });
+  } catch (error) {
+    res.status(500).json({ success: false, message: "Server error", error: error.message });
+  }
+};
+const trackPromotionView = trackPromotion("views");
+const trackPromotionClick = trackPromotion("clicks");
+
 module.exports = {
+  trackPromotionView,
+  trackPromotionClick,
   createPromotion,
   getPromotions,
   updatePromotion,

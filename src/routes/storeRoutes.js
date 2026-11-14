@@ -3,6 +3,7 @@ const router = express.Router();
 const {
   createStore,
   getStore,
+  getMyStoreStats, // ← daily stats for the owner dashboard
   updateStore,
   getAllStores,
   viewStore,
@@ -20,14 +21,16 @@ const {
   bulkCreateStores,
   regeocodeStores,
   searchStores,
-  deleteStore,       
-  deleteAllStores,   
+  deleteStore,
+  deleteAllStores,
+  markRestocked, // ← Milestone 2
 } = require("../controllers/storeController");
 const { authenticate } = require("../utils/auth");
 
-router.get("/search", searchStores);                      
+router.get("/search", searchStores);
 router.post("/", authenticate, createStore);
 router.get("/my-store", authenticate, getStore);
+router.get("/my-store/stats", authenticate, getMyStoreStats);
 router.put("/", authenticate, updateStore);
 router.get("/", authenticate, getAllStores);
 router.post("/view", authenticate, viewStore);
@@ -44,7 +47,8 @@ router.post("/checkin", authenticate, checkInStore);
 router.get("/checkins", authenticate, getCheckedInStores);
 router.post("/bulk-create", authenticate, bulkCreateStores);
 router.post("/regeocode", authenticate, regeocodeStores);
-router.delete("/all", authenticate, deleteAllStores);   
-router.delete("/:id", authenticate, deleteStore);       
+router.post("/restock", authenticate, markRestocked); // ← Milestone 2
+router.delete("/all", authenticate, deleteAllStores);
+router.delete("/:id", authenticate, deleteStore);
 
 module.exports = router;

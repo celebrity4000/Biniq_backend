@@ -5,6 +5,7 @@ const mongoose = require("mongoose");
 const dotenv = require("dotenv");
 const cors = require("cors");
 const { v4: uuidv4 } = require("uuid");
+const cron = require("node-cron");
 const Plan = require("./models/Plan");
 const userRoutes = require("./routes/userRoutes");
 const productRoutes = require("./routes/productRoutes");
@@ -19,6 +20,12 @@ const paymentRoutes = require("./routes/Paymentroutes");
 const exportRoutes = require("./routes/exportRoutes");
 const storeClaimRoutes = require("./routes/storeClaimRoutes");
 const adminClaimRoutes = require("./routes/adminClaimRoutes");
+const reviewRoutes = require("./routes/reviewRoutes");
+const discoveryRoutes = require("./routes/discoveryRoutes");
+const jobRoutes = require("./routes/jobRoutes");
+const { sendDueRestockAlerts } = require("./cron/restockAlerts");
+const { updateStateRankings } = require("./cron/rankingUpdate");
+const { generateAutoPosts } = require("./cron/autoPosts");
 
 // Load environment variables
 dotenv.config();
@@ -59,7 +66,10 @@ app.use("/api/notifications", notificationRoutes);
 app.use("/api/subscriptions", subscriptionRoutes);
 app.use("/api/stats", statsRoutes);
 app.use("/api/export", exportRoutes);
-app.use("/api/payments", paymentRoutes);  // ✅ AFTER express.json()
+app.use("/api/payments", paymentRoutes); 
+app.use("/api/reviews", reviewRoutes);
+app.use("/api/discovery", discoveryRoutes);
+app.use("/api/jobs", jobRoutes);
 
 // ── Global Error Handler ─────────────────────────────────────────
 app.get("/delete-account", (req, res) => {
@@ -121,6 +131,23 @@ mongoose
 
     await initializePlans();
 
+    // ── Milestone 2: restock-alert cron ──────────────────────────────
+    // Runs every 15 minutes, sends the 24hr-before-restock push to
+    // Paid Verified stores' favorited/followed audience.
+    cron.schedule("*/15 * * * *", sendDueRestockAlerts);
+    console.log("Restock alert cron scheduled (every 15 minutes)");
+
+    // ── Milestone 2: state ranking cron ──────────────────────────────
+    // Runs hourly, recomputes each store's real leaderboard position
+    // within its state, and notifies owners on actual position change.
+    cron.schedule("0 * * * *", updateStateRankings);
+    console.log("State ranking cron scheduled (hourly)");
+
+    // ── Auto-generated suggestion posts ──────────────────────────────
+    // Runs daily at 06:00 (set { timezone: "America/New_York" } etc. if needed).
+    cron.schedule("0 6 * * *", generateAutoPosts);
+    console.log("Auto-posts cron scheduled (daily 06:00)");
+
     app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
   })
   .catch((err) => {
@@ -150,6 +177,4 @@ const initializePlans = async () => {
     console.error("Failed to initialize plans:", error);
   }
 };
-// ── Start Server ─────────────────────────────────────────────────
-
-// app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+// (server already starts inside the MongoDB .then() above)

@@ -14,9 +14,18 @@ const promotionSchema = new mongoose.Schema({
   status: { type: String, enum: ["Active", "Inactive"], required: true },
   start_date: { type: Date, required: true },
   end_date: { type: Date, required: true },
-  banner_image: { type: String, default: null }, 
+  banner_image: { type: String, default: null },
   visibility: { type: String, enum: ["On", "Off"], required: true },
   updated_at: { type: Date, default: Date.now },
+
+  // ── Engagement counters (drive Promotion Views / CTR / Most Clicked) ──
+  views: { type: Number, default: 0 },
+  clicks: { type: Number, default: 0 },
+
+  // ── Suggestion templates / auto-posts ──────────────────────────────
+  // bin_price | restock | grand_opening | appreciation | featured | sale | hiring
+  template: { type: String, default: null },
+  auto_generated: { type: Boolean, default: false },
 });
 
 module.exports = mongoose.model("Promotion", promotionSchema);

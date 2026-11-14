@@ -1,6 +1,13 @@
 const { check, validationResult, param, query } = require("express-validator");
 const Store = require("../models/Store");
 const User = require("../models/User");
+const { recalcAndSaveBinIQScore } = require("../utils/binIQScore");
+const { notifyUser, notifyStoreAudience } = require("../utils/notify");
+const { checkPhotoLimit } = require("../utils/photoLimit");
+const { getTodayPrice } = require("../utils/todayPrice");
+const StoreDailyStat = require("../models/StoreDailyStat");
+const { bumpStat, trackView, dayKey } = require("../utils/dailyStats");
+const { applyFeaturedAndScoreSort } = require("../utils/storeRanking");
 
 // Haversine formula to calculate distance between two points (in km)
 const calculateDistance = (lat1, lon1, lat2, lon2) => {
@@ -70,16 +77,13 @@ const sanitiseDailyRates = (raw) => {
 // ⚠️ Move this key to an environment variable (process.env.GOOGLE_MAPS_API_KEY)
 // — it should never be hardcoded/committed, and definitely never shipped in the
 // mobile app bundle the way it currently is in apiService.js / Dashboard2.js.
-const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY || "AIzaSyCY-8_-SbCN29nphT9QFtbzWV5H3asJQ4Q";
+const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Duplicate detection for bulk uploads
 // ─────────────────────────────────────────────────────────────────────────────
-// Matches on normalized store_name + city + state, NOT store_name alone —
-// a chain like "Bulldog Liquidators" legitimately has multiple locations,
-// so name-only matching would wrongly reject those as duplicates.
 const normalizeForDedupe = (s) => String(s || "").toLowerCase().trim().replace(/\s+/g, " ");
 const dedupeKey = (name, city, state) =>
   `${normalizeForDedupe(name)}|${normalizeForDedupe(city)}|${normalizeForDedupe(state)}`;
@@ -87,12 +91,6 @@ const dedupeKey = (name, city, state) =>
 // ─────────────────────────────────────────────────────────────────────────────
 // Free geocoder — U.S. Census Bureau public Geocoder API
 // ─────────────────────────────────────────────────────────────────────────────
-// No API key, no per-request charge, no meaningful rate limit for our volume.
-// Every store in this app is a U.S. address, so this is a perfect match — it's
-// what the Census Bureau built this service for. We try this FIRST and only
-// fall back to paid Google Geocoding for the small percentage of addresses
-// it can't resolve (rural routes, brand-new construction, PO boxes, etc.).
-// Docs: https://geocoding.geo.census.gov/geocoder/
 const geocodeWithCensus = async (addressParts) => {
   const address = addressParts.filter(Boolean).join(", ");
   if (!address) return null;
@@ -126,7 +124,6 @@ const geocodeAddress = async (addressParts) => {
       return { latitude: lat, longitude: lng };
     }
     if (json.status === "OVER_QUERY_LIMIT") {
-      // back off and let the caller retry
       return { rateLimited: true };
     }
   } catch (err) {
@@ -135,31 +132,18 @@ const geocodeAddress = async (addressParts) => {
   return null;
 };
 
-/**
- * Geocode a batch of docs sequentially. Docs that already have lat/lng
- * (from LATITUDE/LONGITUDE columns in the sheet) are skipped entirely —
- * that's free and instant.
- *
- * For everything else: try the free Census geocoder first. Only when
- * Census has no match do we spend a paid Google Geocoding call. In
- * practice most well-formed U.S. street addresses resolve on Census,
- * so this should cut Google usage by the large majority for a bulk
- * upload of typical store addresses.
- */
 const geocodeDocsInPlace = async (docs) => {
   let censusHits = 0;
   let googleFallbacks = 0;
 
   for (const doc of docs) {
-    if (doc.user_latitude && doc.user_longitude) continue; // already has coords
+    if (doc.user_latitude && doc.user_longitude) continue;
     if (!doc.address && !doc.city) continue;
 
-    // 1. Free — U.S. Census Bureau geocoder
     let result = await geocodeWithCensus([doc.address, doc.city, doc.state, doc.zip_code]);
     if (result) {
       censusHits++;
     } else {
-      // 2. Paid fallback — only reached when Census couldn't resolve it
       googleFallbacks++;
       let googleResult = await geocodeAddress([doc.address, doc.city, doc.state, doc.zip_code, doc.country]);
       if (googleResult?.rateLimited) {
@@ -173,8 +157,6 @@ const geocodeDocsInPlace = async (docs) => {
       doc.user_latitude = result.latitude;
       doc.user_longitude = result.longitude;
     }
-    // small politeness delay — Census has no hard limit, but this also
-    // keeps us well under Google's rate limit for the fallback calls
     await sleep(80);
   }
 
@@ -224,7 +206,6 @@ const createStore = [
       daily_rates,
     } = req.body;
 
-    // Validate daily_rates if provided
     let sanitisedRates = {};
     if (daily_rates != null) {
       const result = sanitiseDailyRates(daily_rates);
@@ -241,6 +222,17 @@ const createStore = [
         return res
           .status(400)
           .json({ message: "Store already exists for this user" });
+
+      // Photo limit — 1 free / 8 Paid Verified, enforced on create too.
+      const requestedImages = Array.isArray(store_images) ? store_images : [];
+      if (requestedImages.length > 0) {
+        const { allowed, limit } = await checkPhotoLimit(req.user.userId, requestedImages.length);
+        if (!allowed) {
+          return res.status(403).json({
+            message: `Your plan allows up to ${limit} photo(s). Upgrade to Paid Verified/Premium for up to 8.`,
+          });
+        }
+      }
 
       store = new Store({
         _id: require("uuid").v4(),
@@ -264,7 +256,7 @@ const createStore = [
         twitter_link,
         whatsapp_link,
         store_image,
-        store_images: Array.isArray(store_images) ? store_images : [],  
+        store_images: requestedImages,
         daily_rates: sanitisedRates,
         favorited_by: [],
         liked_by: [],
@@ -290,9 +282,67 @@ const getStore = async (req, res) => {
   try {
     const store = await Store.findOne({ user_id: req.user.userId });
     if (!store) return res.status(404).json({ message: "Store not found" });
-    res.json(store);
+    const storeObj = store.toObject();
+    storeObj.today_price = getTodayPrice(storeObj);
+    res.json(storeObj);
   } catch (error) {
     console.error("Get store error:", error);
+    res.status(500).json({ message: "Server error", error: error.message });
+  }
+};
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/stores/my-store/stats — today / 7-day / previous-7-day numbers for
+// the owner's dashboard. Built from StoreDailyStat (recorded going forward).
+// ─────────────────────────────────────────────────────────────────────────────
+const getMyStoreStats = async (req, res) => {
+  try {
+    const store = await Store.findOne({ user_id: req.user.userId });
+    if (!store) return res.status(404).json({ message: "Store not found" });
+
+    const today = new Date();
+    const dayN = (n) => dayKey(new Date(today.getFullYear(), today.getMonth(), today.getDate() - n));
+    const thisWeek = Array.from({ length: 7 }, (_, i) => dayN(i));        // today … 6 days ago
+    const lastWeek = Array.from({ length: 7 }, (_, i) => dayN(i + 7));    // 7 … 13 days ago
+
+    const rows = await StoreDailyStat.find({
+      store_id: String(store._id),
+      day: { $in: [...thisWeek, ...lastWeek] },
+    }).lean();
+
+    const sum = (days, field) =>
+      rows.filter((r) => days.includes(r.day)).reduce((t, r) => t + (r[field] || 0), 0);
+    const todayRow = rows.find((r) => r.day === thisWeek[0]) || {};
+    // Unique visitors (approximation: unique logged-in viewers)
+    const uniq = (days) => new Set(rows.filter((r) => days.includes(r.day)).flatMap((r) => r.viewers || [])).size;
+
+    const viewsThis = sum(thisWeek, "views");
+    const viewsLast = sum(lastWeek, "views");
+    const trafficChange = viewsLast > 0 ? ((viewsThis - viewsLast) / viewsLast) * 100 : null;
+
+    res.json({
+      today_views: todayRow.views || 0,
+      today_likes: todayRow.likes || 0,
+      today_followers: todayRow.followers || 0,
+      today_checkins: todayRow.checkins || 0,
+      today_visitors: (todayRow.viewers || []).length,
+      weekly_visitors: uniq(thisWeek),
+      weekly_views: viewsThis,
+      weekly_likes: sum(thisWeek, "likes"),
+      weekly_followers: sum(thisWeek, "followers"),
+      weekly_checkins: sum(thisWeek, "checkins"),
+      weekly_promo_views: sum(thisWeek, "promo_views"),
+      views_last_week: viewsLast,
+      traffic_change: trafficChange,
+      // aliases the app also understands
+      views_today: todayRow.views || 0,
+      views_this_week: viewsThis,
+      likes_this_week: sum(thisWeek, "likes"),
+      checkins_today: todayRow.checkins || 0,
+    });
+  } catch (error) {
+    console.error("Get my store stats error:", error);
     res.status(500).json({ message: "Server error", error: error.message });
   }
 };
@@ -303,15 +353,25 @@ const getStore = async (req, res) => {
 const updateStore = async (req, res) => {
   try {
     const { user_id: _ignored, daily_rates, ...rest } = req.body;
-    if (rest.store_images != null) {
-  if (!Array.isArray(rest.store_images)) {
-    return res.status(400).json({ message: "store_images must be an array of URLs" });
-  }
-  if (rest.store_images.length > 10) {
-    return res.status(400).json({ message: "Maximum 10 store images allowed" });
-  }
-}
     const userId = req.user.userId;
+
+    if (rest.store_images != null) {
+      if (!Array.isArray(rest.store_images)) {
+        return res.status(400).json({ message: "store_images must be an array of URLs" });
+      }
+      const { allowed, limit } = await checkPhotoLimit(userId, rest.store_images.length);
+      if (!allowed) {
+        return res.status(403).json({
+          message: `Your plan allows up to ${limit} photo(s). Upgrade to Paid Verified/Premium for up to 8.`,
+        });
+      }
+    }
+
+    // Fetch the current doc first so we can diff for notification triggers.
+    const existingStore = await Store.findOne({ user_id: userId });
+    if (!existingStore) {
+      return res.status(404).json({ message: "Store not found for this user" });
+    }
 
     const updates = { ...rest, updated_at: Date.now() };
 
@@ -322,6 +382,9 @@ const updateStore = async (req, res) => {
       for (const [day, price] of Object.entries(result.sanitised)) {
         updates[`daily_rates.${day}`] = price;
       }
+    }
+    if (rest.today_price != null) {
+      updates.today_price_updated_at = new Date();
     }
 
     const result = await Store.collection.updateOne(
@@ -334,6 +397,29 @@ const updateStore = async (req, res) => {
     }
 
     const updated = await Store.collection.findOne({ user_id: userId });
+
+    // ── Notification triggers (fire-and-forget, don't block the response) ──
+    const priceBefore = existingStore.today_price ?? getTodayPrice(existingStore.toObject());
+    const priceAfter = updated.today_price ?? getTodayPrice(updated);
+    if (priceBefore !== priceAfter) {
+      notifyStoreAudience(existingStore._id, {
+        heading: "Price Changed Today",
+        content: `${existingStore.store_name}'s price today is now ${priceAfter ?? "unavailable"}.`,
+        event_type: "price_changed",
+      }).catch((err) => console.error("Price change notification failed:", err.message));
+    }
+
+    const imagesBefore = existingStore.store_images?.length || 0;
+    const imagesAfter = updated.store_images?.length || 0;
+    if (imagesAfter > imagesBefore) {
+      notifyStoreAudience(existingStore._id, {
+        heading: "New Photos Posted",
+        content: `${existingStore.store_name} just posted new photos.`,
+        event_type: "new_photos",
+      }).catch((err) => console.error("New photos notification failed:", err.message));
+    }
+
+    updated.today_price = getTodayPrice(updated);
     res.json({ message: "Store updated successfully", store: updated });
   } catch (error) {
     console.error("Update store error:", error);
@@ -346,8 +432,12 @@ const updateStore = async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 const getAllStores = async (req, res) => {
   try {
-    const stores = await Store.find();
-    res.json(stores);
+    const stores = await Store.find().lean();
+    // Same ordering as /api/discovery/finder — Paid Verified stores first,
+    // then highest Bin IQ Score — so it's consistent regardless of which
+    // endpoint a given screen happens to call.
+    const sorted = await applyFeaturedAndScoreSort(stores);
+    res.json(sorted);
   } catch (error) {
     console.error("Get all stores error:", error);
     res.status(500).json({ message: "Server error", error: error.message });
@@ -370,6 +460,7 @@ const viewStore = [
       if (!store) return res.status(404).json({ message: "Store not found" });
       store.views_count += 1;
       await store.save();
+      trackView(store, req.user.userId);
       res.json({
         message: "Store view recorded",
         views_count: store.views_count,
@@ -407,11 +498,22 @@ const likeStore = [
         );
         store.likes = Math.max(0, store.likes - 1);
         await store.save();
+        recalcAndSaveBinIQScore(store._id).catch((e) => console.error("Score recalc failed:", e.message));
         res.json({ message: "Store unliked", isLiked: false, likes: store.likes });
       } else {
         store.liked_by.push(userId);
         store.likes += 1;
         await store.save();
+        bumpStat(store._id, "likes");
+        recalcAndSaveBinIQScore(store._id).catch((e) => console.error("Score recalc failed:", e.message));
+        notifyUser({
+          userId: store.user_id,
+          heading: "New Like",
+          content: `${store.store_name} got a new like.`,
+          type: "store_owner",
+          event_type: "new_like",
+          store_id: store._id,
+        }).catch((e) => console.error("New like notification failed:", e.message));
         res.json({ message: "Store liked", isLiked: true, likes: store.likes });
       }
     } catch (error) {
@@ -449,11 +551,22 @@ const followStore = [
         );
         store.followers = Math.max(0, store.followers - 1);
         await store.save();
+        recalcAndSaveBinIQScore(store._id).catch((e) => console.error("Score recalc failed:", e.message));
         res.json({ message: "Store unfollowed", isFollowed: false, followers: store.followers });
       } else {
         store.followed_by.push(userId);
         store.followers += 1;
         await store.save();
+        bumpStat(store._id, "followers");
+        recalcAndSaveBinIQScore(store._id).catch((e) => console.error("Score recalc failed:", e.message));
+        notifyUser({
+          userId: store.user_id,
+          heading: "New Follower",
+          content: `${store.store_name} has a new follower.`,
+          type: "store_owner",
+          event_type: "new_follower",
+          store_id: store._id,
+        }).catch((e) => console.error("New follower notification failed:", e.message));
         res.json({ message: "Store followed", isFollowed: true, followers: store.followers });
       }
     } catch (error) {
@@ -518,7 +631,10 @@ const getStoreDetails = [
       if (!store) return res.status(404).json({ message: "Store not found" });
       store.views_count += 1;
       await store.save();
-      res.json(store);
+      trackView(store, req.user.userId);
+      const storeObj = store.toObject();
+      storeObj.today_price = getTodayPrice(storeObj);
+      res.json(storeObj);
     } catch (error) {
       console.error("Get store details error:", error);
       res.status(500).json({ message: "Server error", error: error.message });
@@ -572,7 +688,7 @@ const favoriteStore = [
 const getFavoriteStores = async (req, res) => {
   try {
     const stores = await Store.find({ favorited_by: req.user.userId }).select(
-      "store_name address city user_latitude user_longitude views_count likes followers comments store_image store_images image daily_rates",
+      "store_name address city user_latitude user_longitude views_count likes followers comments store_image store_images image daily_rates today_price",
     );
     res.json(stores);
   } catch (error) {
@@ -603,7 +719,7 @@ const getFavoriteStoresByUserId = [
 
     try {
       const stores = await Store.find({ favorited_by: user_id }).select(
-        "store_name address city user_latitude user_longitude views_count likes followers comments store_image store_images image daily_rates",
+        "store_name address city user_latitude user_longitude views_count likes followers comments store_image store_images image daily_rates today_price",
       );
       res.json(stores);
     } catch (error) {
@@ -642,11 +758,11 @@ const getNearbyStores = [
       const stores = await Store.find({
         user_latitude: { $ne: null },
         user_longitude: { $ne: null },
-      }).select("store_name user_latitude user_longitude");
+      }).select("store_name user_latitude user_longitude user_id bin_iq_score");
 
       const userLat = parseFloat(latitude);
       const userLon = parseFloat(longitude);
-      const nearbyStores = stores
+      let nearbyStores = stores
         .map((store) => {
           const distance = calculateDistance(
             userLat, userLon,
@@ -666,6 +782,13 @@ const getNearbyStores = [
           .status(200)
           .json({ message: `No stores found within ${radius} km`, stores: [] });
       }
+
+      // Attach the Paid Verified badge for the UI, but deliberately keep
+      // distance as the primary sort — reordering "nearby" results by
+      // score would defeat the point of a proximity search. This is why
+      // nearby stays separate from getAllStores/searchStores below.
+      nearbyStores = await applyFeaturedAndScoreSort(nearbyStores);
+      nearbyStores.sort((a, b) => a.distance_km - b.distance_km);
 
       res.json(nearbyStores);
     } catch (error) {
@@ -703,10 +826,21 @@ const checkInStore = [
           (id) => id.toString() !== userId,
         );
         await store.save();
+        recalcAndSaveBinIQScore(store._id).catch((e) => console.error("Score recalc failed:", e.message));
         return res.json({ message: "Checked out successfully", isCheckedIn: false });
       } else {
         store.checked_in_by.push(userId);
         await store.save();
+        bumpStat(store._id, "checkins");
+        recalcAndSaveBinIQScore(store._id).catch((e) => console.error("Score recalc failed:", e.message));
+        notifyUser({
+          userId: store.user_id,
+          heading: "New Check-in",
+          content: `Someone checked in at ${store.store_name}.`,
+          type: "store_owner",
+          event_type: "new_check_in",
+          store_id: store._id,
+        }).catch((e) => console.error("New check-in notification failed:", e.message));
         return res.json({ message: "Checked in successfully", isCheckedIn: true });
       }
     } catch (error) {
@@ -741,6 +875,8 @@ const getTopStores = async (req, res) => {
           store_images: 1,
           ratings: 1,
           daily_rates: 1,
+          today_price: 1,
+          bin_iq_score: 1,
         },
       },
     ]);
@@ -764,7 +900,7 @@ const getCheckedInStores = async (req, res) => {
     const stores = await Store.find({
       checked_in_by: req.user.userId,
     }).select(
-      "store_name address city user_latitude user_longitude store_image store_images image ratings likes followers daily_rates",
+      "store_name address city user_latitude user_longitude store_image store_images image ratings likes followers daily_rates today_price",
     );
     res.json(stores);
   } catch (error) {
@@ -790,7 +926,6 @@ const bulkCreateStores = async (req, res) => {
   const BATCH_SIZE = 500;
   const results = { created: [], failed: [] };
 
-  // 1. Validate & build docs first (sync, fast)
   const validDocs = [];
   for (const storeData of stores) {
     const {
@@ -869,14 +1004,12 @@ const bulkCreateStores = async (req, res) => {
 
   await geocodeDocsInPlace(dedupedDocs);
 
-  // 3. Insert in batches of 500
   for (let i = 0; i < dedupedDocs.length; i += BATCH_SIZE) {
     const batch = dedupedDocs.slice(i, i + BATCH_SIZE);
     try {
       const inserted = await Store.insertMany(batch, { ordered: false });
       inserted.forEach(s => results.created.push({ store_name: s.store_name, store_id: s._id, geocoded: !!(s.user_latitude && s.user_longitude) }));
     } catch (err) {
-      // ordered: false means partial inserts succeed; writeErrors has the failures
       if (err.insertedDocs?.length) {
         err.insertedDocs.forEach(s => results.created.push({ store_name: s.store_name, store_id: s._id, geocoded: !!(s.user_latitude && s.user_longitude) }));
       }
@@ -913,9 +1046,12 @@ const searchStores = async (req, res) => {
         { address:    regex },
         { city:       regex },
       ],
-    }).select("_id store_name address city state user_id verified");
+    }).select("_id store_name address city state user_id verified bin_iq_score").lean();
 
-    res.json(stores);
+    // Search ordering isn't otherwise meaningful, so Paid Verified + score
+    // sort applies here the same as getAllStores/discovery.
+    const sorted = await applyFeaturedAndScoreSort(stores);
+    res.json(sorted);
   } catch (error) {
     res.status(500).json({ message: "Server error", error: error.message });
   }
@@ -924,13 +1060,6 @@ const searchStores = async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // RE-GEOCODE STORES MISSING COORDINATES (admin only)
 // ─────────────────────────────────────────────────────────────────────────────
-// Fixes stores that were already created (via bulk-create, single create, or
-// an earlier buggy upload) but never got a usable user_latitude/user_longitude
-// — including the ones that were silently missing `country` before this fix,
-// which hurt Google geocoding accuracy for non-U.S. addresses. Finds every
-// store with null/missing coords, re-runs Census → Google geocoding using
-// whatever address/city/state/zip_code/country data it already has, and
-// updates in place. No re-upload needed.
 const regeocodeStores = async (req, res) => {
   if (req.user.role !== 1) {
     return res.status(403).json({ message: "Admin access required" });
@@ -1039,9 +1168,50 @@ const deleteAllStores = async (req, res) => {
   }
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// MARK RESTOCKED (Milestone 2) — owner marks their store as freshly
+// restocked; notifies favorited/followed customers immediately, and sets
+// next_restock_at so the 24hr-before cron job (cron/restockAlerts.js) can
+// alert Paid Verified stores' audience ahead of time.
+// ─────────────────────────────────────────────────────────────────────────────
+const markRestocked = [
+  check("next_restock_at").optional().isISO8601().withMessage("next_restock_at must be a valid date"),
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ success: false, errors: errors.array() });
+
+    const userId = req.user.userId;
+    const { next_restock_at } = req.body;
+
+    try {
+      const store = await Store.findOne({ user_id: userId });
+      if (!store) return res.status(404).json({ success: false, message: "Store not found for this user" });
+
+      store.last_restocked_at = new Date();
+      if (next_restock_at) {
+        store.next_restock_at = new Date(next_restock_at);
+        store.restock_alert_sent = false;
+      }
+      await store.save();
+
+      await notifyStoreAudience(store._id, {
+        heading: "Favorite Store Restocked",
+        content: `${store.store_name} just restocked.`,
+        event_type: "store_restocked",
+      });
+
+      res.json({ success: true, message: "Store marked as restocked and audience notified" });
+    } catch (error) {
+      console.error("Mark restocked error:", error);
+      res.status(500).json({ success: false, message: "Server error", error: error.message });
+    }
+  },
+];
+
 module.exports = {
   createStore,
   getStore,
+  getMyStoreStats,
   updateStore,
   getAllStores,
   viewStore,
@@ -1061,4 +1231,5 @@ module.exports = {
   searchStores,
   deleteStore,
   deleteAllStores,
+  markRestocked,
 };

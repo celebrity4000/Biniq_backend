@@ -1,5 +1,5 @@
-  const mongoose = require("mongoose");
-  const { v4: uuidv4 } = require("uuid");
+const mongoose = require("mongoose");
+const { v4: uuidv4 } = require("uuid");
 
 const userSchema = new mongoose.Schema({
   _id: { type: String, default: uuidv4 },
@@ -46,10 +46,18 @@ const userSchema = new mongoose.Schema({
     enum: ["pending", "approved", "rejected"],
     default: "pending",
   },
-    total_scans: { type: Number, default: 0 },
-    scans_used: [{ type: String, default: [] }],
-    created_at: { type: Date, default: Date.now },
-    updated_at: { type: Date, default: Date.now },
-  });
+  total_scans: { type: Number, default: 0 },
+  scans_used: [{ type: String, default: [] }],
 
-  module.exports = mongoose.model("User", userSchema);
+  // ── Milestone 2 addition ──────────────────────────────────────────
+  // Set from the RN apps after Notifications.getExpoPushTokenAsync().
+  // utils/pushDelivery.js picks this up automatically the moment it's
+  // populated — no other backend change needed to start sending real
+  // push notifications.
+  expo_push_token: { type: String, default: null },
+
+  created_at: { type: Date, default: Date.now },
+  updated_at: { type: Date, default: Date.now },
+});
+
+module.exports = mongoose.model("User", userSchema);

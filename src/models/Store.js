@@ -49,7 +49,7 @@ const storeSchema = new mongoose.Schema({
   verified: { type: Boolean, default: false },
   checked_in_by: { type: [String], default: [] },
   store_image: { type: String, default: null },
-  store_images: { type: [String], default: [] }, 
+  store_images: { type: [String], default: [] },
   ratings: { type: Number, default: 0 },
   rating_count: { type: Number, default: 0 },
   views_count: { type: Number, default: 0 },
@@ -57,7 +57,33 @@ const storeSchema = new mongoose.Schema({
   liked_by: [{ type: String, ref: "User", default: [] }],
   followed_by: [{ type: String, ref: "User", default: [] }],
   comments: [commentSchema],
-  daily_rates: { type: dailyRatesSchema, default: () => ({}) }, // ← added
+  daily_rates: { type: dailyRatesSchema, default: () => ({}) },
+
+  // ── Milestone 2 additions ────────────────────────────────────────────
+  // Single banner price shown instead of the full daily_rates list.
+  // Falls back to today's entry in daily_rates when not explicitly set —
+  // see utils/todayPrice.js.
+  today_price: { type: String, default: null },
+  today_price_updated_at: { type: Date, default: null },
+
+  // Timestamp the owner marks when new stock arrives — drives the
+  // "Favorite Store Restocked" push notification and the 24hr pre-restock alert.
+  last_restocked_at: { type: Date, default: null },
+  next_restock_at: { type: Date, default: null }, // used for the 24hr-before alert
+  restock_alert_sent: { type: Boolean, default: false }, // reset to false whenever next_restock_at is set
+
+  // Bin IQ Score™ — recalculated via utils/binIQScore.js whenever a scoring
+  // input changes (check-in, like, follow, review). Cached here so
+  // discovery/leaderboard queries can just sort on this field.
+  bin_iq_score: { type: Number, default: 0, index: true },
+  bin_iq_score_updated_at: { type: Date, default: null },
+
+  // True leaderboard position within the store's state, recalculated by
+  // cron/rankingUpdate.js. Distinct from bin_iq_score moving up/down —
+  // this is the store's actual rank vs. every other store in its state.
+  state_rank: { type: Number, default: null },
+  state_rank_updated_at: { type: Date, default: null },
+
   created_at: { type: Date, default: Date.now },
   updated_at: { type: Date, default: Date.now },
 });
